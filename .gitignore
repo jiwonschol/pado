@@ -1,0 +1,19 @@
+# Internal planning and research documents — not part of the public repo
+PLANS/
+RESEARCH/
+
+# Secrets and environment
+.env
+.env.*
+*.pem
+*.key
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+
+# Dependencies and build output
+node_modules/
+dist/
+build/
+*.log
