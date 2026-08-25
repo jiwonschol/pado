@@ -19,4 +19,4 @@ build/
 *.log
 
 # Local scratch — machine-local captures and experiments, never published
-/test/
+/.pado-local/
