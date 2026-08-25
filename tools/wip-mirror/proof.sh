@@ -181,7 +181,7 @@ fi
 
 # 9. Secret scanning reads exact tree blobs and handles unusual filenames.
 SECRET_VALUE="s""k-proof-$(printf 'a%.0s' 1 2 3 4 5 6 7 8 9 10 11 12)"
-WEIRD_FILE="$SRC/odd
+WEIRD_FILE="$SRC/odd-$SECRET_VALUE
 name-파일.py"
 printf 'token = "%s"\n' "$SECRET_VALUE" > "$WEIRD_FILE"
 capture "$SRC" "$ROOT/before-secret.txt"
@@ -270,17 +270,36 @@ mkdir -p "$ROOT/bin"
 GH_STUB="$ROOT/bin/gh"
 cat > "$GH_STUB" <<'STUB'
 #!/bin/bash
-repo="${2:-}"
-selector="${4:-}"
+host="${GH_HOST:-github.com}"
+repo=""
+selector=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    api) shift ;;
+    --hostname) host="${2:-}"; shift 2 ;;
+    --jq) selector="${2:-}"; shift 2 ;;
+    repos/*) repo=$1; shift ;;
+    *) shift ;;
+  esac
+done
 case "$repo" in
   repos/example/public) visibility=public; writable=true ;;
   repos/example/private) visibility=private; writable=true ;;
   repos/example/readonly) visibility=private; writable=false ;;
+  repos/example/host-confusion)
+    if [ "$host" = "github.com" ]; then
+      visibility=public
+    else
+      visibility=private
+    fi
+    writable=true
+    ;;
   *) exit 1 ;;
 esac
 case "$selector" in
   .visibility) printf '%s\n' "$visibility" ;;
   .permissions.push) printf '%s\n' "$writable" ;;
+  *visibility*permissions.push*) printf '%s\t%s\n' "$visibility" "$writable" ;;
   *) exit 1 ;;
 esac
 STUB
@@ -356,7 +375,211 @@ else
   bad "snapshot continued after probe cleanup failure"
 fi
 
-# 19. Log is private even when the caller supplies its path.
+# 19. GH_HOST cannot redirect the safety lookup away from github.com.
+HOST_SRC="$ROOT/host-src"
+init_committed_repo "$HOST_SRC"
+HOST_URL="https://github.com/example/host-confusion.git"
+git -C "$HOST_SRC" remote add origin "$HOST_URL"
+git -C "$HOST_SRC" config --add pado.approvedRemote "$HOST_URL"
+HOST_BIN="$ROOT/host-bin"
+HOST_PUSH_MARKER="$ROOT/host-push-attempted"
+REAL_GIT=$(command -v git)
+mkdir -p "$HOST_BIN"
+cat > "$HOST_BIN/git" <<'STUB'
+#!/bin/bash
+for arg in "$@"; do
+  if [ "$arg" = "push" ]; then
+    : > "$PADO_PUSH_MARKER"
+    exit 0
+  fi
+done
+exec "$PADO_REAL_GIT" "$@"
+STUB
+chmod +x "$HOST_BIN/git"
+GH_HOST="enterprise.invalid" \
+PADO_REAL_GIT="$REAL_GIT" \
+PADO_PUSH_MARKER="$HOST_PUSH_MARKER" \
+PATH="$HOST_BIN:$ROOT/bin:$PATH" \
+  bash "$MIRROR" "$HOST_SRC" origin >/dev/null
+rc=$?
+if [ "$rc" = 3 ] && [ ! -e "$HOST_PUSH_MARKER" ]; then
+  ok "GitHub safety lookup stayed pinned to github.com"
+else
+  bad "GH_HOST redirected or bypassed the GitHub safety lookup"
+fi
+
+# 20. Candidate-path enumeration errors stop before any remote write.
+ENUM_BIN="$ROOT/enum-bin"
+mkdir -p "$ENUM_BIN"
+cat > "$ENUM_BIN/git" <<'STUB'
+#!/bin/bash
+for arg in "$@"; do
+  if [ "$arg" = "$PADO_FAIL_GIT_SUBCOMMAND" ]; then
+    exit 9
+  fi
+done
+exec "$PADO_REAL_GIT" "$@"
+STUB
+chmod +x "$ENUM_BIN/git"
+
+FILES_SRC="$ROOT/files-enum-src"
+FILES_BARE="$ROOT/files-enum-remote.git"
+init_committed_repo "$FILES_SRC"
+git init -q --bare "$FILES_BARE"
+git -C "$FILES_SRC" remote add origin "$FILES_BARE"
+PADO_FAIL_GIT_SUBCOMMAND="ls-files" \
+PADO_REAL_GIT="$REAL_GIT" \
+PATH="$ENUM_BIN:$PATH" \
+PADO_TEST_APPROVED_REMOTE=1 \
+  bash "$MIRROR" "$FILES_SRC" origin >/dev/null
+rc=$?
+files_enum_refs=$(git -C "$FILES_BARE" for-each-ref | wc -l | tr -d ' ')
+if [ "$rc" = 1 ] && [ "$files_enum_refs" = 0 ]; then
+  ok "candidate-path enumeration error stopped before remote writes"
+else
+  bad "candidate-path enumeration error failed open"
+fi
+
+# 21. Snapshot-tree enumeration errors stop before any remote write.
+TREE_SRC="$ROOT/tree-enum-src"
+TREE_BARE="$ROOT/tree-enum-remote.git"
+init_committed_repo "$TREE_SRC"
+git init -q --bare "$TREE_BARE"
+git -C "$TREE_SRC" remote add origin "$TREE_BARE"
+PADO_FAIL_GIT_SUBCOMMAND="ls-tree" \
+PADO_REAL_GIT="$REAL_GIT" \
+PATH="$ENUM_BIN:$PATH" \
+PADO_TEST_APPROVED_REMOTE=1 \
+  bash "$MIRROR" "$TREE_SRC" origin >/dev/null
+rc=$?
+tree_enum_refs=$(git -C "$TREE_BARE" for-each-ref | wc -l | tr -d ' ')
+if [ "$rc" = 1 ] && [ "$tree_enum_refs" = 0 ]; then
+  ok "snapshot-tree enumeration error stopped before remote writes"
+else
+  bad "snapshot-tree enumeration error failed open"
+fi
+
+# 22. External clean filters stop before the filter process or any push.
+FILTER_SRC="$ROOT/filter-src"
+FILTER_BARE="$ROOT/filter-remote.git"
+FILTER_SCRIPT="$ROOT/filter-clean.sh"
+FILTER_MARKER="$ROOT/filter-called"
+init_committed_repo "$FILTER_SRC"
+printf '*.filtered filter=fixture\n' > "$FILTER_SRC/.gitattributes"
+git -C "$FILTER_SRC" add .gitattributes
+git -C "$FILTER_SRC" commit -qm attributes
+cat > "$FILTER_SCRIPT" <<'FILTER'
+#!/bin/sh
+: > "$PADO_FILTER_MARKER"
+cat
+FILTER
+chmod +x "$FILTER_SCRIPT"
+git -C "$FILTER_SRC" config filter.fixture.clean "$FILTER_SCRIPT"
+printf 'ordinary content\n' > "$FILTER_SRC/payload.filtered"
+git init -q --bare "$FILTER_BARE"
+git -C "$FILTER_SRC" remote add origin "$FILTER_BARE"
+PADO_FILTER_MARKER="$FILTER_MARKER" \
+PADO_TEST_APPROVED_REMOTE=1 \
+  bash "$MIRROR" "$FILTER_SRC" origin >/dev/null
+rc=$?
+filter_refs=$(git -C "$FILTER_BARE" for-each-ref | wc -l | tr -d ' ')
+if [ "$rc" = 4 ] && [ "$filter_refs" = 0 ] && [ ! -e "$FILTER_MARKER" ]; then
+  ok "external filter stopped before filter execution and remote writes"
+else
+  bad "external filter executed or reached the outbound snapshot"
+fi
+
+# 23. Canonical LFS pointers stop before any hook or remote write.
+LFS_SRC="$ROOT/lfs-src"
+LFS_BARE="$ROOT/lfs-remote.git"
+LFS_HOOK_MARKER="$ROOT/lfs-hook-called"
+init_committed_repo "$LFS_SRC"
+printf 'version https://git-lfs.github.com/spec/v1\noid sha256:%s\nsize 42\n' \
+  "$(printf 'a%.0s' 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31 32 33 34 35 36 37 38 39 40 41 42 43 44 45 46 47 48 49 50 51 52 53 54 55 56 57 58 59 60 61 62 63 64)" \
+  > "$LFS_SRC/large.dat"
+git -C "$LFS_SRC" add large.dat
+git -C "$LFS_SRC" commit -qm lfs-pointer
+git init -q --bare "$LFS_BARE"
+git -C "$LFS_SRC" remote add origin "$LFS_BARE"
+cat > "$LFS_SRC/.git/hooks/pre-push" <<'HOOK'
+#!/bin/sh
+: > "$PADO_HOOK_MARKER"
+HOOK
+chmod +x "$LFS_SRC/.git/hooks/pre-push"
+PADO_HOOK_MARKER="$LFS_HOOK_MARKER" \
+PADO_TEST_APPROVED_REMOTE=1 \
+  bash "$MIRROR" "$LFS_SRC" origin >/dev/null
+rc=$?
+lfs_refs=$(git -C "$LFS_BARE" for-each-ref | wc -l | tr -d ' ')
+if [ "$rc" = 4 ] && [ "$lfs_refs" = 0 ] && [ ! -e "$LFS_HOOK_MARKER" ]; then
+  ok "LFS pointer stopped before hooks and remote writes"
+else
+  bad "LFS pointer or pre-push upload channel was accepted"
+fi
+
+# 24. A repository hook cannot change the destination between validation and use.
+MUTATE_SRC="$ROOT/mutate-src"
+MUTATE_SAFE="$ROOT/mutate-safe.git"
+MUTATE_UNSAFE="$ROOT/mutate-unsafe.git"
+MUTATE_COUNT="$ROOT/mutate-hook-count"
+init_committed_repo "$MUTATE_SRC"
+git init -q --bare "$MUTATE_SAFE"
+git init -q --bare "$MUTATE_UNSAFE"
+git -C "$MUTATE_SRC" remote add origin "$MUTATE_SAFE"
+cat > "$MUTATE_SRC/.git/hooks/pre-push" <<'HOOK'
+#!/bin/sh
+count=0
+[ ! -f "$PADO_HOOK_COUNT" ] || read -r count < "$PADO_HOOK_COUNT"
+count=$((count + 1))
+printf '%s\n' "$count" > "$PADO_HOOK_COUNT"
+if [ "$count" = 2 ]; then
+  "$PADO_REAL_GIT" -C "$PADO_MUTATION_REPO" remote set-url origin "$PADO_UNSAFE_REMOTE"
+fi
+HOOK
+chmod +x "$MUTATE_SRC/.git/hooks/pre-push"
+PADO_HOOK_COUNT="$MUTATE_COUNT" \
+PADO_REAL_GIT="$REAL_GIT" \
+PADO_MUTATION_REPO="$MUTATE_SRC" \
+PADO_UNSAFE_REMOTE="$MUTATE_UNSAFE" \
+PADO_TEST_APPROVED_REMOTE=1 \
+  bash "$MIRROR" "$MUTATE_SRC" origin >/dev/null
+rc=$?
+mutate_safe_ref=$(snapshot_ref "$MUTATE_SAFE")
+mutate_unsafe_refs=$(git -C "$MUTATE_UNSAFE" for-each-ref | wc -l | tr -d ' ')
+if [ "$rc" = 0 ] && [ -n "$mutate_safe_ref" ] \
+    && [ "$mutate_unsafe_refs" = 0 ] && [ ! -e "$MUTATE_COUNT" ]; then
+  ok "validated destination stayed bound through every push"
+else
+  bad "repository hook changed or observed the outbound push sequence"
+fi
+
+# 25. Every validated push URL receives the same synthetic snapshot.
+MULTI_SRC="$ROOT/multi-src"
+MULTI_ONE="$ROOT/multi-one.git"
+MULTI_TWO="$ROOT/multi-two.git"
+init_committed_repo "$MULTI_SRC"
+git init -q --bare "$MULTI_ONE"
+git init -q --bare "$MULTI_TWO"
+git -C "$MULTI_SRC" remote add origin "$MULTI_ONE"
+git -C "$MULTI_SRC" remote set-url --add --push origin "$MULTI_ONE"
+git -C "$MULTI_SRC" remote set-url --add --push origin "$MULTI_TWO"
+PADO_TEST_APPROVED_REMOTE=1 bash "$MIRROR" "$MULTI_SRC" origin >/dev/null
+rc=$?
+multi_one_ref=$(snapshot_ref "$MULTI_ONE")
+multi_two_ref=$(snapshot_ref "$MULTI_TWO")
+if [ "$rc" = 0 ] && [ -n "$multi_one_ref" ] && [ -n "$multi_two_ref" ]; then
+  multi_one_sha=$(git -C "$MULTI_ONE" rev-parse "$multi_one_ref")
+  multi_two_sha=$(git -C "$MULTI_TWO" rev-parse "$multi_two_ref")
+  if [ "$multi_one_sha" = "$multi_two_sha" ]; then
+    ok "all validated push URLs received the same snapshot"
+  else
+    bad "validated push URLs received different snapshots"
+  fi
+else
+  bad "multiple validated push URLs were not preserved"
+fi
+
+# 26. Log is private even when the caller supplies its path.
 if [ "$(file_mode "$PADO_LOG")" = 600 ]; then
   ok "log permissions are owner-only"
 else

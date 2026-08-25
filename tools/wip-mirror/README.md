@@ -25,7 +25,8 @@ The script stops before sending a snapshot unless all of these checks pass:
    fetch URL. Unsupported providers, public/internal repositories, missing API
    results, missing push access, URL credentials, and unapproved URLs all stop.
 2. It builds the immutable Git tree first and scans the exact blobs that would
-   be pushed. Sensitive filenames and common credential patterns stop the run.
+   be pushed. Sensitive filenames, common credential patterns, external Git
+   filters, and Git LFS pointers stop the run.
 3. It sends a harmless, empty root commit to a unique probe ref and requires
    successful probe cleanup.
 4. It creates the snapshot as a synthetic root commit. Local `HEAD` and its
@@ -33,7 +34,10 @@ The script stops before sending a snapshot unless all of these checks pass:
 
 The pattern-based secret gate is a secondary defense and cannot recognize every
 secret. Explicit destination approval remains required. Logs omit destination
-URLs and secret values and are written with owner-only permissions.
+URLs, filenames, and secret values and are written with owner-only permissions.
+Outbound Git objects are copied into an isolated temporary repository, and
+repository pre-push hooks are skipped. Every write uses the exact URL that was
+validated rather than resolving the remote name again.
 
 The successful snapshot is stored at:
 
@@ -96,5 +100,7 @@ inventory, or development repository. Its checks cover:
 - source state invariance and byte-identical content restoration;
 - ignored, staged, untracked, unusual-name, and subdirectory cases;
 - exact-tree secret blocking without value logging;
+- external-filter and Git LFS rejection before hooks or remote writes;
+- GitHub API host pinning and validation-to-push destination binding;
 - local-history exclusion, repeat snapshots, and unborn repositories;
 - unique probe cleanup, URL-credential redaction, and private log permissions.

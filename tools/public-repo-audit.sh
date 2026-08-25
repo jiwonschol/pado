@@ -1,5 +1,5 @@
 #!/bin/bash
-# Fail when tracked/public Git content contains local-only artifacts or identity leaks.
+# Fail when any reachable public Git object contains local-only artifacts or identity leaks.
 set -u
 
 if [ "$#" -gt 1 ]; then
@@ -17,84 +17,131 @@ fi
 ROOT=$(git -C "$START_DIR" rev-parse --show-toplevel 2>/dev/null) || exit 1
 cd "$ROOT" || exit 1
 
-FAIL=0
+TMP_WORK=$(mktemp -d "${TMPDIR:-/tmp}/pado-public-audit.XXXXXX") || exit 1
+trap 'rm -rf -- "$TMP_WORK"' EXIT
 
-fail_path() {
-  printf 'PUBLIC-AUDIT FAIL: tracked local-only path: %q\n' "$1" >&2
+FAIL=0
+PATH_FAILURE_REPORTED=0
+
+short_oid() {
+  printf '%s\n' "${1%${1#????????????}}"
+}
+
+fail_object() {
+  object_id=$1
+  object_type=$2
+  rule=$3
+  printf 'PUBLIC-AUDIT FAIL: reachable %s %s violates %s (matched value omitted)\n' \
+    "$object_type" "$(short_oid "$object_id")" "$rule" >&2
   FAIL=1
 }
 
-while IFS= read -r -d '' path; do
-  case "$path" in
-    PLANS/*|RESEARCH/*|test/*|tools/wip-mirror/run/*|*.log|*.pem|*.key|*.p12|*.mobileprovision|*.xcresult|*/.DS_Store|.DS_Store|.env|.env.*|*/.env|*/.env.*)
-      fail_path "$path"
+fail_scan() {
+  object_id=$1
+  object_type=$2
+  printf 'PUBLIC-AUDIT FAIL: could not inspect reachable %s %s\n' \
+    "$object_type" "$(short_oid "$object_id")" >&2
+  FAIL=1
+}
+
+fail_path_once() {
+  tree=$1
+  if [ "$PATH_FAILURE_REPORTED" = 0 ]; then
+    printf 'PUBLIC-AUDIT FAIL: reachable tree %s contains a local-only path (path omitted)\n' \
+      "$(short_oid "$tree")" >&2
+    PATH_FAILURE_REPORTED=1
+  fi
+  FAIL=1
+}
+
+# Split scanner literals so this script remains subject to its own rules.
+MAC_HOME="/""Users/"
+LINUX_HOME="/""home/"
+WINDOWS_HOME='[A-Za-z]:\\'"Users"'\\'
+PERSONAL_PATH_PATTERN="(${MAC_HOME}[^/[:space:][][^/[:space:]]*|${LINUX_HOME}[^/[:space:][][^/[:space:]]*|${WINDOWS_HOME}[^\\[:space:][][^\\[:space:]]*)"
+
+AWS_PREFIX="AK""IA"
+GH_PREFIX="gh""p_"
+OPENAI_PREFIX="s""k-"
+GOOGLE_PREFIX="AI""za"
+SLACK_PREFIX="xo""x"
+PRIVATE_KEY_WORDS="PRIVATE"" KEY"
+CREDENTIAL_PATTERN="(${AWS_PREFIX}[0-9A-Z]{16}|${GH_PREFIX}[A-Za-z0-9]{20,}|${OPENAI_PREFIX}[A-Za-z0-9_-]{20,}|${GOOGLE_PREFIX}[A-Za-z0-9_-]{10,}|${SLACK_PREFIX}[baprs]-[A-Za-z0-9-]{10,}|BEGIN [A-Z ]*${PRIVATE_KEY_WORDS})"
+EMAIL_PATTERN='[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}'
+
+OBJECTS="$TMP_WORK/objects"
+OBJECTS_UNSORTED="$TMP_WORK/objects-unsorted"
+if ! git rev-list --objects --all --no-object-names > "$OBJECTS_UNSORTED"; then
+  printf 'PUBLIC-AUDIT FAIL: could not enumerate reachable objects\n' >&2
+  exit 1
+fi
+if ! sort -u "$OBJECTS_UNSORTED" > "$OBJECTS"; then
+  printf 'PUBLIC-AUDIT FAIL: could not prepare reachable object list\n' >&2
+  exit 1
+fi
+
+# Object policy: inspect paths from every reachable tree, including tree-only
+# tags, and raw bytes from blobs, commits, and annotated tags.
+while IFS= read -r object_id; do
+  [ -n "$object_id" ] || continue
+  object_type=$(git cat-file -t "$object_id" 2>/dev/null) || {
+    fail_scan "$object_id" "object"
+    continue
+  }
+  case "$object_type" in
+    tree)
+      TREE_FILE="$TMP_WORK/tree"
+      if ! git ls-tree -r -z --full-tree "$object_id" > "$TREE_FILE"; then
+        fail_scan "$object_id" "$object_type"
+        continue
+      fi
+      while IFS= read -r -d '' entry; do
+        path=${entry#*$'\t'}
+        case "$path" in
+          PLANS/*|RESEARCH/*|.pado-local/*|tools/wip-mirror/run/*|*.log|*.pem|*.key|*.p12|*.mobileprovision|*.xcresult|*/.DS_Store|.DS_Store|.env|.env.*|*/.env|*/.env.*)
+            fail_path_once "$object_id"
+            ;;
+        esac
+      done < "$TREE_FILE"
+      continue
       ;;
+    blob|commit|tag) ;;
+    *) continue ;;
   esac
-done < <(git ls-files -z)
 
-while IFS= read -r -d '' path; do
-  [ "$path" = "tools/public-repo-audit.sh" ] && continue
-  if grep -I -qE '(/Users/[^/[:space:]]+|/home/[^/[:space:]]+|[A-Za-z]:\\Users\\[^\\[:space:]]+)' "$path" 2>/dev/null; then
-    fail_path "$path"
+  OBJECT_FILE="$TMP_WORK/object"
+  if ! git cat-file "$object_type" "$object_id" > "$OBJECT_FILE"; then
+    fail_scan "$object_id" "$object_type"
+    continue
   fi
-done < <(git ls-files -z)
 
-while IFS= read -r -d '' path; do
-  case "$path" in
-    tools/public-repo-audit.sh|tools/wip-mirror/wip-mirror.sh) continue ;;
+  LC_ALL=C grep -a -qE "$PERSONAL_PATH_PATTERN" "$OBJECT_FILE"
+  grep_rc=$?
+  case "$grep_rc" in
+    0) fail_object "$object_id" "$object_type" "personal-path" ;;
+    1) ;;
+    *) fail_scan "$object_id" "$object_type" ;;
   esac
-  if grep -I -qE '(AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{20,}|sk-[A-Za-z0-9_-]{20,}|AIza[A-Za-z0-9_-]{10,}|xox[baprs]-[A-Za-z0-9-]{10,}|BEGIN [A-Z ]*PRIVATE KEY)' "$path" 2>/dev/null; then
-    fail_path "$path"
-  fi
-done < <(git ls-files -z)
 
-while IFS= read -r -d '' path; do
-  [ "$path" = "tools/public-repo-audit.sh" ] && continue
-  emails=$(grep -I -Eo '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' "$path" 2>/dev/null || true)
+  LC_ALL=C grep -a -qE "$CREDENTIAL_PATTERN" "$OBJECT_FILE"
+  grep_rc=$?
+  case "$grep_rc" in
+    0) fail_object "$object_id" "$object_type" "credential-pattern" ;;
+    1) ;;
+    *) fail_scan "$object_id" "$object_type" ;;
+  esac
+
+  emails=$(LC_ALL=C grep -a -Eo "$EMAIL_PATTERN" "$OBJECT_FILE" 2>/dev/null || true)
   for email in $emails; do
     case "$email" in
       git@github.com|*@users.noreply.github.com|noreply@github.com|noreply@anthropic.com) ;;
-      *) fail_path "$path" ;;
+      *) fail_object "$object_id" "$object_type" "non-noreply-email" ;;
     esac
   done
-done < <(git ls-files -z)
-
-while IFS=$'\t' read -r commit email; do
-  case "$email" in
-    *@users.noreply.github.com|*@invalid|noreply@github.com|noreply@anthropic.com) ;;
-    *)
-      printf 'PUBLIC-AUDIT FAIL: commit %s uses a non-noreply author email\n' "${commit%${commit#????????????}}" >&2
-      FAIL=1
-      ;;
-  esac
-done < <(git log --format='%H%x09%ae')
-
-while IFS=$'\t' read -r commit email; do
-  case "$email" in
-    *@users.noreply.github.com|*@invalid|noreply@github.com|noreply@anthropic.com) ;;
-    *)
-      printf 'PUBLIC-AUDIT FAIL: commit %s uses a non-noreply committer email\n' "${commit%${commit#????????????}}" >&2
-      FAIL=1
-      ;;
-  esac
-done < <(git log --format='%H%x09%ce')
-
-for commit in $(git rev-list HEAD); do
-  emails=$(git show -s --format='%B' "$commit" \
-    | grep -Eo '[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}' || true)
-  for email in $emails; do
-    case "$email" in
-      *@users.noreply.github.com|*@invalid|noreply@github.com|noreply@anthropic.com) ;;
-      *)
-        printf 'PUBLIC-AUDIT FAIL: commit %s message contains a non-noreply email\n' "${commit%${commit#????????????}}" >&2
-        FAIL=1
-        ;;
-    esac
-  done
-done
+done < "$OBJECTS"
 
 if [ "$FAIL" = 0 ]; then
-  printf 'PUBLIC-AUDIT PASS: tracked files and reachable commit metadata are public-safe\n'
+  printf 'PUBLIC-AUDIT PASS: all reachable Git paths, objects, and metadata are public-safe\n'
 fi
 
 exit "$FAIL"

@@ -116,10 +116,10 @@ for push_url in "${PUSH_URLS[@]}"; do
   command -v gh >/dev/null 2>&1 \
     || stop "GitHub CLI unavailable; destination safety is undetermined; no snapshot push"
 
-  visibility=$(gh api "repos/$owner_repo" --jq '.visibility' 2>/dev/null) \
-    || stop "GitHub visibility lookup failed; no snapshot push"
-  can_push=$(gh api "repos/$owner_repo" --jq '.permissions.push' 2>/dev/null) \
-    || stop "GitHub push-permission lookup failed; no snapshot push"
+  api_result=$(gh api --hostname github.com "repos/$owner_repo" \
+    --jq '[.visibility, .permissions.push] | @tsv' 2>/dev/null) \
+    || stop "GitHub destination lookup failed; no snapshot push"
+  IFS=$'\t' read -r visibility can_push <<< "$api_result"
 
   [ "$visibility" = "private" ] \
     || stop "effective GitHub push destination is not confirmed private; no snapshot push"
@@ -131,12 +131,41 @@ for push_url in "${PUSH_URLS[@]}"; do
   log "PRECONDITION: effective GitHub push destination is private, writable, and approved"
 done
 
-# Build the exact tree first. The secret gate scans these immutable blobs, so a
-# concurrent edit can only wait for the next mirror; it cannot enter unscanned.
+# All later candidate and object lists are materialized so producer failures
+# cannot look like an empty, successful scan through process substitution.
 TMP_WORK=$(mktemp -d "${TMPDIR:-/tmp}/pado-wip.XXXXXX") || exit 1
 TMP_INDEX="$TMP_WORK/index"
+FILTER_PATHS="$TMP_WORK/filter-paths"
+TREE_ENTRIES="$TMP_WORK/tree-entries"
 trap 'rm -rf -- "$TMP_WORK"' EXIT
 
+# Reject external clean filters before `git add` can invoke them. Supporting an
+# external object store requires separately validating its payload and endpoint.
+if ! git -C "$REPO" ls-files --cached --others --exclude-standard -z > "$FILTER_PATHS"; then
+  log "ERROR: could not enumerate snapshot candidates"
+  exit 1
+fi
+while IFS= read -r -d '' path; do
+  if ! filter_value=$(git -C "$REPO" check-attr -z filter -- "$path" | (
+      IFS= read -r -d '' _path || exit 1
+      IFS= read -r -d '' _attribute || exit 1
+      IFS= read -r -d '' value || exit 1
+      printf '%s' "$value"
+    )); then
+    log "ERROR: could not inspect Git filter attributes"
+    exit 1
+  fi
+  case "$filter_value" in
+    ""|unspecified|unset) ;;
+    *)
+      log "SECRET GATE: snapshot blocked; reason=external-filter (path and value not recorded)"
+      exit 4
+      ;;
+  esac
+done < "$FILTER_PATHS"
+
+# Build the exact tree first. The secret gate scans these immutable blobs, so a
+# concurrent edit can only wait for the next mirror; it cannot enter unscanned.
 if HEAD_SHA=$(git -C "$REPO" rev-parse --verify HEAD 2>/dev/null); then
   GIT_INDEX_FILE="$TMP_INDEX" git -C "$REPO" read-tree "$HEAD_SHA" || exit 1
 else
@@ -147,9 +176,14 @@ fi
 GIT_INDEX_FILE="$TMP_INDEX" git -C "$REPO" add -A || exit 1
 TREE=$(GIT_INDEX_FILE="$TMP_INDEX" git -C "$REPO" write-tree) || exit 1
 
-BLOCKED_FILE=""
 BLOCKED_REASON=""
 SECRET_PATTERN="(^|[^A-Za-z0-9_])(sk-[A-Za-z0-9_-]{8,}|ghp_[A-Za-z0-9]{20,}|AIza[A-Za-z0-9_-]{10,}|xox[baprs]-)|PRIVATE KEY|(api[_-]?key|secret|token|password)[[:space:]]*[:=][[:space:]]*['\"]?[^[:space:]'\"]{12,}"
+LFS_POINTER_HEADER="version https://git-lfs.github.com/spec/v1"
+BLOB_FILE="$TMP_WORK/blob"
+if ! git -C "$REPO" ls-tree -r -z "$TREE" > "$TREE_ENTRIES"; then
+  log "ERROR: could not enumerate snapshot tree"
+  exit 1
+fi
 while IFS= read -r -d '' entry; do
   metadata=${entry%%$'\t'*}
   path=${entry#*$'\t'}
@@ -160,23 +194,29 @@ while IFS= read -r -d '' entry; do
 
   case "$path" in
     .env|.env.*|*/.env|*/.env.*|*.pem|*.key|*/id_rsa|*/id_ed25519)
-      BLOCKED_FILE="$path"
       BLOCKED_REASON="sensitive-filename"
       break
       ;;
   esac
 
-  if git -C "$REPO" cat-file blob "$object_id" \
-      | grep -qE "$SECRET_PATTERN"; then
-    BLOCKED_FILE="$path"
-    BLOCKED_REASON="content-pattern"
+  git -C "$REPO" cat-file blob "$object_id" > "$BLOB_FILE" || exit 1
+
+  LC_ALL=C grep -a -qE "$SECRET_PATTERN" "$BLOB_FILE"
+  grep_rc=$?
+  case "$grep_rc" in
+    0) BLOCKED_REASON="content-pattern"; break ;;
+    1) ;;
+    *) log "ERROR: secret scanner failed"; exit 1 ;;
+  esac
+
+  if LC_ALL=C head -n 1 "$BLOB_FILE" | grep -qFx "$LFS_POINTER_HEADER"; then
+    BLOCKED_REASON="git-lfs-pointer"
     break
   fi
-done < <(git -C "$REPO" ls-tree -r -z "$TREE")
+done < "$TREE_ENTRIES"
 
-if [ -n "$BLOCKED_FILE" ]; then
-  printf -v blocked_file_safe '%q' "$BLOCKED_FILE"
-  log "SECRET GATE: snapshot blocked; file=$blocked_file_safe reason=$BLOCKED_REASON (value not recorded)"
+if [ -n "$BLOCKED_REASON" ]; then
+  log "SECRET GATE: snapshot blocked; reason=$BLOCKED_REASON (path and value not recorded)"
   exit 4
 fi
 
@@ -198,15 +238,6 @@ HOST=$(printf '%s' "$HOST" | tr -c 'A-Za-z0-9._-' '-')
 [ -n "$HOST" ] || HOST="host"
 PROBE="refs/pado-wip/_probe/$HOST/$$-$(date +%s)-${RANDOM:-0}"
 
-if ! git -C "$REPO" push -q "$REMOTE" "$PROBE_COMMIT:$PROBE" 2>/dev/null; then
-  stop "custom-ref write probe failed; no snapshot push"
-fi
-if ! git -C "$REPO" push -q "$REMOTE" ":$PROBE" 2>/dev/null; then
-  log "PRECONDITION FAIL-CLOSED: probe cleanup failed; snapshot was not pushed"
-  exit 3
-fi
-log "PRECONDITION: unique write probe succeeded and was removed"
-
 if branch=$(git -C "$REPO" symbolic-ref --quiet --short HEAD 2>/dev/null); then
   :
 elif [ "$HEAD_SHA" = "unborn" ]; then
@@ -219,10 +250,59 @@ git check-ref-format "$WIP_REF" >/dev/null 2>&1 \
   || stop "derived mirror ref is invalid; snapshot was not pushed"
 
 SNAPSHOT_COMMIT=$(synthetic_commit "$TREE" "pado-wip snapshot") || exit 1
-if ! git -C "$REPO" push -q -f "$REMOTE" "$SNAPSHOT_COMMIT:$WIP_REF" 2>/dev/null; then
-  log "ERROR: snapshot push failed"
+
+# Transfer only the two synthetic roots into a clean temporary repository. All
+# outbound writes use the exact URLs already validated above, with local hooks
+# disabled, so repository config cannot change the destination or upload LFS.
+OUTBOUND_REPO="$TMP_WORK/outbound.git"
+OUTBOUND_PACK="$TMP_WORK/outbound.pack"
+git init -q --bare --template= "$OUTBOUND_REPO" || exit 1
+if ! printf '%s\n%s\n' "$PROBE_COMMIT" "$SNAPSHOT_COMMIT" \
+    | git -C "$REPO" pack-objects --stdout --revs > "$OUTBOUND_PACK"; then
+  log "ERROR: could not isolate outbound snapshot objects"
   exit 1
 fi
+git -C "$OUTBOUND_REPO" index-pack --stdin < "$OUTBOUND_PACK" >/dev/null || exit 1
+
+push_exact() {
+  destination=$1
+  refspec=$2
+  git -C "$OUTBOUND_REPO" push --no-verify -q "$destination" "$refspec" 2>/dev/null
+}
+
+push_exact_force() {
+  destination=$1
+  refspec=$2
+  git -C "$OUTBOUND_REPO" push --no-verify -q -f "$destination" "$refspec" 2>/dev/null
+}
+
+PROBED_URLS=()
+for push_url in "${PUSH_URLS[@]}"; do
+  if ! push_exact "$push_url" "$PROBE_COMMIT:$PROBE"; then
+    for cleanup_url in "${PROBED_URLS[@]}"; do
+      push_exact "$cleanup_url" ":$PROBE" >/dev/null 2>&1 || true
+    done
+    stop "custom-ref write probe failed; no snapshot push"
+  fi
+  PROBED_URLS+=("$push_url")
+done
+
+cleanup_failed=0
+for push_url in "${PROBED_URLS[@]}"; do
+  push_exact "$push_url" ":$PROBE" || cleanup_failed=1
+done
+if [ "$cleanup_failed" != 0 ]; then
+  log "PRECONDITION FAIL-CLOSED: probe cleanup failed; snapshot was not pushed"
+  exit 3
+fi
+log "PRECONDITION: unique write probe succeeded and was removed"
+
+for push_url in "${PUSH_URLS[@]}"; do
+  if ! push_exact_force "$push_url" "$SNAPSHOT_COMMIT:$WIP_REF"; then
+    log "ERROR: snapshot push failed"
+    exit 1
+  fi
+done
 
 log "MIRROR OK: snapshot ref updated"
 printf '%s\n' "$SNAPSHOT_COMMIT"
