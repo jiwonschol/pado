@@ -54,6 +54,17 @@ fail_path_once() {
   FAIL=1
 }
 
+is_current_github_pr_merge() {
+  object_id=$1
+  [ -n "${PADO_GITHUB_PR_MERGE_SHA:-}" ] || return 1
+  [ "$object_id" = "$PADO_GITHUB_PR_MERGE_SHA" ] || return 1
+  [ "$(git show -s --format='%ce' "$object_id" 2>/dev/null)" = "noreply@github.com" ] \
+    || return 1
+  subject=$(git show -s --format='%s' "$object_id" 2>/dev/null) || return 1
+  printf '%s\n' "$subject" \
+    | LC_ALL=C grep -qE '^Merge [0-9a-f]{40} into [0-9a-f]{40}$'
+}
+
 # Split scanner literals so this script remains subject to its own rules.
 MAC_HOME="/""Users/"
 LINUX_HOME="/""home/"
@@ -131,7 +142,17 @@ while IFS= read -r object_id; do
     *) fail_scan "$object_id" "$object_type" ;;
   esac
 
-  emails=$(LC_ALL=C grep -a -Eo "$EMAIL_PATTERN" "$OBJECT_FILE" 2>/dev/null || true)
+  EMAIL_FILE="$OBJECT_FILE"
+  if [ "$object_type" = "commit" ] && is_current_github_pr_merge "$object_id"; then
+    EMAIL_FILE="$TMP_WORK/email-object"
+    if ! LC_ALL=C sed 's/^author .*$/author GitHub PR merge <noreply@github.com>/' \
+        "$OBJECT_FILE" > "$EMAIL_FILE"; then
+      fail_scan "$object_id" "$object_type"
+      continue
+    fi
+  fi
+
+  emails=$(LC_ALL=C grep -a -Eo "$EMAIL_PATTERN" "$EMAIL_FILE" 2>/dev/null || true)
   for email in $emails; do
     case "$email" in
       git@github.com|*@users.noreply.github.com|noreply@github.com|noreply@anthropic.com) ;;

@@ -96,6 +96,32 @@ else
   bad "reachable-object enumeration failure fixture did not execute"
 fi
 
+# GitHub's current PR merge commit may carry the intentionally public account
+# email as author. Only the exact event SHA may receive that narrow allowance.
+MERGE_REPO=$(clone_fixture pr-merge)
+merge_base=$(git -C "$MERGE_REPO" rev-parse HEAD)
+printf 'head content\n' > "$MERGE_REPO/head.txt"
+git -C "$MERGE_REPO" add head.txt
+git -C "$MERGE_REPO" commit -qm head
+merge_head=$(git -C "$MERGE_REPO" rev-parse HEAD)
+merge_tree=$(git -C "$MERGE_REPO" rev-parse HEAD^{tree})
+PUBLIC_AUTHOR_EMAIL="synthetic-public@""example.test"
+merge_sha=$(GIT_AUTHOR_NAME="public-account" \
+  GIT_AUTHOR_EMAIL="$PUBLIC_AUTHOR_EMAIL" \
+  GIT_COMMITTER_NAME="GitHub" \
+  GIT_COMMITTER_EMAIL="noreply@github.com" \
+  git -C "$MERGE_REPO" commit-tree "$merge_tree" \
+    -p "$merge_head" -p "$merge_base" \
+    -m "Merge $merge_head into $merge_base")
+git -C "$MERGE_REPO" update-ref refs/pull/1/merge "$merge_sha"
+expect_block "unapproved public commit email blocked" "$MERGE_REPO"
+if PADO_GITHUB_PR_MERGE_SHA="$merge_sha" bash "$AUDIT" "$MERGE_REPO" \
+    > "$ROOT/result.log" 2>&1; then
+  ok "exact GitHub PR merge author email accepted"
+else
+  bad "exact GitHub PR merge author email was not narrowly accepted"
+fi
+
 # A leading-dash filename must never become a grep option.
 OPTION_REPO=$(clone_fixture option-name)
 OPTION_NAME='--exclude=*'
