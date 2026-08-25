@@ -122,6 +122,42 @@ else
   bad "exact GitHub PR merge author email was not narrowly accepted"
 fi
 
+# After a PR is merged, its GitHub-created merge commit remains in public
+# history. Accept its author email only when the signed merge shape is inside
+# an explicitly trusted history boundary.
+HISTORICAL_MERGE_REPO=$(clone_fixture historical-pr-merge)
+historical_base=$(git -C "$HISTORICAL_MERGE_REPO" rev-parse HEAD)
+printf 'historical head\n' > "$HISTORICAL_MERGE_REPO/head.txt"
+git -C "$HISTORICAL_MERGE_REPO" add head.txt
+git -C "$HISTORICAL_MERGE_REPO" commit -qm head
+historical_head=$(git -C "$HISTORICAL_MERGE_REPO" rev-parse HEAD)
+historical_tree=$(git -C "$HISTORICAL_MERGE_REPO" rev-parse HEAD^{tree})
+HISTORICAL_COMMIT_INPUT="$ROOT/historical-commit"
+{
+  printf 'tree %s\n' "$historical_tree"
+  printf 'parent %s\n' "$historical_base"
+  printf 'parent %s\n' "$historical_head"
+  printf 'author public-account <%s> 1700000000 +0000\n' "$PUBLIC_AUTHOR_EMAIL"
+  printf 'committer GitHub <noreply@github.com> 1700000000 +0000\n'
+  printf 'gpgsig -----BEGIN PGP SIGNATURE-----\n'
+  printf ' synthetic-test-signature\n'
+  printf ' -----END PGP SIGNATURE-----\n'
+  printf '\nMerge pull request #1 from synthetic-account/historical-branch\n\n'
+  printf 'Synthetic merge\n'
+} > "$HISTORICAL_COMMIT_INPUT"
+historical_merge_sha=$(git -C "$HISTORICAL_MERGE_REPO" \
+  hash-object -t commit -w --stdin < "$HISTORICAL_COMMIT_INPUT")
+git -C "$HISTORICAL_MERGE_REPO" update-ref refs/heads/main \
+  "$historical_merge_sha"
+if PADO_GITHUB_TRUSTED_HISTORY_SHA="$historical_merge_sha" \
+    bash "$AUDIT" "$HISTORICAL_MERGE_REPO" > "$ROOT/result.log" 2>&1; then
+  ok "trusted historical GitHub PR merge author email accepted"
+else
+  bad "trusted historical GitHub PR merge author email was not accepted"
+fi
+expect_block "untrusted signed merge-shaped public email blocked" \
+  "$HISTORICAL_MERGE_REPO"
+
 # A leading-dash filename must never become a grep option.
 OPTION_REPO=$(clone_fixture option-name)
 OPTION_NAME='--exclude=*'

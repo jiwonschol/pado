@@ -21,6 +21,7 @@ jobs:
       - name: Reject private metadata and local-only artifacts
         env:
           PADO_GITHUB_PR_MERGE_SHA: ${{ github.event_name == 'pull_request' && github.sha || '' }}
+          PADO_GITHUB_TRUSTED_HISTORY_SHA: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.sha }}
         run: bash tools/public-repo-audit.sh
 
   wip-mirror-proof:
