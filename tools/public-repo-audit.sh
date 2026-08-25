@@ -22,6 +22,24 @@ trap 'rm -rf -- "$TMP_WORK"' EXIT
 
 FAIL=0
 PATH_FAILURE_REPORTED=0
+TRUSTED_HISTORY_SHA=
+
+if [ -n "${PADO_GITHUB_TRUSTED_HISTORY_SHA:-}" ]; then
+  if ! TRUSTED_HISTORY_SHA=$(git rev-parse --verify \
+      "${PADO_GITHUB_TRUSTED_HISTORY_SHA}^{commit}" 2>/dev/null); then
+    printf 'PUBLIC-AUDIT FAIL: trusted history boundary is not a commit\n' >&2
+    exit 1
+  fi
+else
+  if DEFAULT_REMOTE_REF=$(git symbolic-ref --quiet \
+      refs/remotes/origin/HEAD 2>/dev/null); then
+    TRUSTED_HISTORY_SHA=$(git rev-parse --verify \
+      "${DEFAULT_REMOTE_REF}^{commit}" 2>/dev/null) || TRUSTED_HISTORY_SHA=
+  elif git rev-parse --verify refs/heads/main^{commit} >/dev/null 2>&1; then
+    TRUSTED_HISTORY_SHA=$(git rev-parse --verify refs/heads/main^{commit}) \
+      || TRUSTED_HISTORY_SHA=
+  fi
+fi
 
 short_oid() {
   printf '%s\n' "${1%${1#????????????}}"
@@ -63,6 +81,32 @@ is_current_github_pr_merge() {
   subject=$(git show -s --format='%s' "$object_id" 2>/dev/null) || return 1
   printf '%s\n' "$subject" \
     | LC_ALL=C grep -qE '^Merge [0-9a-f]{40} into [0-9a-f]{40}$'
+}
+
+is_historical_github_pr_merge() {
+  object_id=$1
+  [ -n "$TRUSTED_HISTORY_SHA" ] || return 1
+  git merge-base --is-ancestor "$object_id" "$TRUSTED_HISTORY_SHA" \
+    >/dev/null 2>&1 || return 1
+  [ "$(git show -s --format='%cn' "$object_id" 2>/dev/null)" = "GitHub" ] \
+    || return 1
+  [ "$(git show -s --format='%ce' "$object_id" 2>/dev/null)" = "noreply@github.com" ] \
+    || return 1
+  parents=$(git show -s --format='%P' "$object_id" 2>/dev/null) || return 1
+  set -- $parents
+  [ "$#" -eq 2 ] || return 1
+  subject=$(git show -s --format='%s' "$object_id" 2>/dev/null) || return 1
+  printf '%s\n' "$subject" \
+    | LC_ALL=C grep -qE '^Merge pull request #[1-9][0-9]* from [^[:space:]]+/[^[:space:]]+$' \
+    || return 1
+  git cat-file commit "$object_id" 2>/dev/null \
+    | LC_ALL=C grep -a -q '^gpgsig -----BEGIN PGP SIGNATURE-----$'
+}
+
+is_allowed_github_pr_merge_author() {
+  object_id=$1
+  is_current_github_pr_merge "$object_id" \
+    || is_historical_github_pr_merge "$object_id"
 }
 
 # Split scanner literals so this script remains subject to its own rules.
@@ -143,7 +187,8 @@ while IFS= read -r object_id; do
   esac
 
   EMAIL_FILE="$OBJECT_FILE"
-  if [ "$object_type" = "commit" ] && is_current_github_pr_merge "$object_id"; then
+  if [ "$object_type" = "commit" ] \
+      && is_allowed_github_pr_merge_author "$object_id"; then
     EMAIL_FILE="$TMP_WORK/email-object"
     if ! LC_ALL=C sed 's/^author .*$/author GitHub PR merge <noreply@github.com>/' \
         "$OBJECT_FILE" > "$EMAIL_FILE"; then
